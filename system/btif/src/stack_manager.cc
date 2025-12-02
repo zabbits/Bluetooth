@@ -119,6 +119,7 @@ static bool stack_is_initialized;
 // If running, the stack is fully up and able to bluetooth.
 static bool stack_is_running;
 
+// stack_manager_t.h 中定义的方法通过对应的event_*实现
 static void event_init_stack(std::promise<void> promise, bluetooth::core::CoreInterface* interface);
 static void event_start_up_stack(bluetooth::core::CoreInterface* interface,
                                  ProfileStartCallback startProfiles,
@@ -147,6 +148,7 @@ static void init_stack(bluetooth::core::CoreInterface* interface) {
   // state modification only happens there. Using the thread to perform
   // all stack operations ensures that the operations are done serially
   // and do not overlap.
+  // 在management_thread中执行, 且保证同步执行
   std::promise<void> promise;
   auto future = promise.get_future();
   management_thread.DoInThread(FROM_HERE, base::BindOnce(event_init_stack, std::move(promise),
@@ -195,13 +197,22 @@ static void shut_down_rust_module_async() {
 static bool get_stack_is_running() { return stack_is_running; }
 
 // Internal functions
+// 并未使用
 extern const module_t bt_utils_module;
+// bt接口层配置模块
+// system/btif/src/btif_config.cc
 extern const module_t btif_config_module;
+// gd兼容层模块
 extern const module_t gd_shim_module;
+// 交互模块
 extern const module_t interop_module;
+// osi模块
 extern const module_t osi_module;
+// rust模块
 extern const module_t rust_module;
+// 协议栈配置模块
 extern const module_t stack_config_module;
+// 设备配置模块
 extern const module_t device_iot_config_module;
 
 struct module_lookup {
@@ -233,23 +244,32 @@ inline const module_t* get_local_module(const char* name) {
   return nullptr;
 }
 
+// 实际执行初始化步骤
 static void init_stack_internal(bluetooth::core::CoreInterface* interface) {
   // all callbacks out of libbluetooth-core happen via this interface
   interfaceToProfiles = interface;
 
+  // 启动模块管理, system/btcore/include/module.h
   module_management_start();
 
+  // 启动主线程, system/stack/include/main_thread.h, system/stack/btu/main_thread.cc
   main_thread_start_up();
 
+  // 进行各个模块的初始化
+  // 这里仅有一个 RUST 模块没有进行初始化
   module_init(get_local_module(DEVICE_IOT_CONFIG_MODULE));
   module_init(get_local_module(OSI_MODULE));
+  // GD兼容层执行startup
   module_start_up(get_local_module(GD_SHIM_MODULE));
   module_init(get_local_module(BTIF_CONFIG_MODULE));
+  // system/btif/include/btif_api.h, system/btif/src/btif_core.cc
+  // 这里启动jni线程
   btif_init_bluetooth();
 
   module_init(get_local_module(INTEROP_MODULE));
   module_init(get_local_module(STACK_CONFIG_MODULE));
 
+  // 记录完成初始化
   // stack init is synchronous, so no waiting necessary here
   stack_is_initialized = true;
 }
@@ -294,9 +314,13 @@ static void event_start_up_stack(bluetooth::core::CoreInterface* interface,
   hack_future = local_hack_future;
 
   info("Gd shim module enabled");
+  // system/stack/include/btm_client_interface.h
+  // system/stack/btm/btm_client_interface.cc
+  // 初始化btm
   get_btm_client_interface().lifecycle.btm_init();
   module_start_up(get_local_module(BTIF_CONFIG_MODULE));
 
+  // 初始化各个profile
   l2c_init();
   sdp_init();
   gatt_init();
@@ -307,17 +331,25 @@ static void event_start_up_stack(bluetooth::core::CoreInterface* interface,
   GAP_Init();
   AIS_Init();
 
+  // 启动profile
+  // startProfiles::start_profiles
   startProfiles();
 
+  // system/bta/sys/bta_sys_main.cc
   bta_sys_init();
 
+  // btif_core.cc
   btif_init_ok();
+  // system/bta/dm/bta_dm_api.cc
   BTA_dm_init();
+  // system/bta/dm/bta_dm_act.cc
   bta_dm_enable(btif_dm_sec_evt, btif_dm_acl_evt);
 
+  // system/stack/acl/btm_acl.cc
   btm_acl_device_down();
   get_btm_client_interface().lifecycle.BTM_reset_complete();
 
+  // bta_dm_act.cc
   BTA_dm_on_hw_on();
 
   if (future_await(local_hack_future) != FUTURE_SUCCESS) {
@@ -338,9 +370,11 @@ static void event_start_up_stack(bluetooth::core::CoreInterface* interface,
 
   stack_is_running = true;
   info("finished");
+  // 通过jni发送协议栈完成启动事件
   do_in_jni_thread(base::BindOnce(event_signal_stack_up, nullptr));
 }
 
+// shutdown 与 startup 相对应
 // Synchronous function to shut down the stack
 static void event_shut_down_stack(ProfileStopCallback stopProfiles) {
   if (!stack_is_running) {
@@ -412,6 +446,7 @@ static void ensure_stack_is_not_running(ProfileStopCallback stopProfiles) {
   }
 }
 
+// cleanup 与 init 对应
 // Synchronous function to clean up the stack
 static void event_clean_up_stack(std::promise<void> promise, ProfileStopCallback stopProfiles) {
   if (!stack_is_initialized) {
@@ -476,6 +511,7 @@ static const stack_manager_t interface = {
         get_stack_is_running};
 
 const stack_manager_t* stack_manager_get_interface() {
+  // 首先确保 manager 线程启动
   ensure_manager_initialized();
   return &interface;
 }
